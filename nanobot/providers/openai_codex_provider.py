@@ -17,11 +17,29 @@ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
 
 
-class OpenAICodexProvider(LLMProvider):
-    """Use Codex OAuth to call the Responses API."""
+def _resolve_codex_url(api_base: str | None) -> str:
+    """Resolve Codex responses endpoint from optional api_base override."""
+    if not api_base:
+        return DEFAULT_CODEX_URL
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
-        super().__init__(api_key=None, api_base=None)
+    base = api_base.rstrip("/")
+    if base.endswith("/responses"):
+        return base
+    if base.endswith("/codex"):
+        return f"{base}/responses"
+    return f"{base}/codex/responses"
+
+
+class OpenAICodexProvider(LLMProvider):
+    """Use Codex OAuth or API key to call the Responses API."""
+
+    def __init__(
+        self,
+        default_model: str = "openai-codex/gpt-5.1-codex",
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ):
+        super().__init__(api_key=api_key, api_base=api_base)
         self.default_model = default_model
 
     async def chat(
@@ -37,8 +55,14 @@ class OpenAICodexProvider(LLMProvider):
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
-        token = await asyncio.to_thread(get_codex_token)
-        headers = _build_headers(token.account_id, token.access)
+        if self.api_key:
+            headers = _build_api_key_headers(self.api_key)
+        else:
+            token = await asyncio.to_thread(get_codex_token)
+            account_id = token.account_id
+            if not account_id:
+                raise RuntimeError("Codex OAuth token is missing account_id")
+            headers = _build_oauth_headers(account_id, token.access)
 
         body: dict[str, Any] = {
             "model": _strip_model_prefix(model),
@@ -59,16 +83,22 @@ class OpenAICodexProvider(LLMProvider):
         if tools:
             body["tools"] = _convert_tools(tools)
 
-        url = DEFAULT_CODEX_URL
+        url = _resolve_codex_url(self.api_base)
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=True
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
-                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+                logger.warning(
+                    "SSL certificate verification failed for Codex API; retrying with verify=False"
+                )
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=False
+                )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
@@ -90,13 +120,21 @@ def _strip_model_prefix(model: str) -> str:
     return model
 
 
-def _build_headers(account_id: str, token: str) -> dict[str, str]:
+def _build_oauth_headers(account_id: str, token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "chatgpt-account-id": account_id,
         "OpenAI-Beta": "responses=experimental",
         "originator": DEFAULT_ORIGINATOR,
         "User-Agent": "nanobot (python)",
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+    }
+
+
+def _build_api_key_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
         "accept": "text/event-stream",
         "content-type": "application/json",
     }
@@ -112,7 +150,9 @@ async def _request_codex(
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                raise RuntimeError(
+                    _friendly_error(response.status_code, text.decode("utf-8", "ignore"))
+                )
             return await _consume_sse(response)
 
 
@@ -125,12 +165,14 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not name:
             continue
         params = fn.get("parameters") or {}
-        converted.append({
-            "type": "function",
-            "name": name,
-            "description": fn.get("description") or "",
-            "parameters": params if isinstance(params, dict) else {},
-        })
+        converted.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": fn.get("description") or "",
+                "parameters": params if isinstance(params, dict) else {},
+            }
+        )
     return converted
 
 
@@ -181,7 +223,9 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
 
         if role == "tool":
             call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            output_text = (
+                content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            )
             input_items.append(
                 {
                     "type": "function_call_output",
@@ -291,7 +335,7 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                 tool_calls.append(
                     ToolCallRequest(
                         id=f"{call_id}|{buf.get('id') or item.get('id') or 'fc_0'}",
-                        name=buf.get("name") or item.get("name"),
+                        name=buf.get("name") or item.get("name") or "unknown_function",
                         arguments=args,
                     )
                 )
@@ -304,7 +348,12 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
     return content, tool_calls, finish_reason
 
 
-_FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
+_FINISH_REASON_MAP = {
+    "completed": "stop",
+    "incomplete": "length",
+    "failed": "error",
+    "cancelled": "error",
+}
 
 
 def _map_finish_reason(status: str | None) -> str:

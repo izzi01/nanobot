@@ -6,10 +6,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
-from nanobot.cli.commands import app
+from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
-from nanobot.providers.openai_codex_provider import _strip_model_prefix
+from nanobot.providers.openai_codex_provider import (
+    OpenAICodexProvider,
+    _build_api_key_headers,
+    _resolve_codex_url,
+    _strip_model_prefix,
+)
 from nanobot.providers.registry import find_by_model
 
 
@@ -28,11 +33,12 @@ class _StopGateway(RuntimeError):
 @pytest.fixture
 def mock_paths():
     """Mock config/workspace paths for test isolation."""
-    with patch("nanobot.config.loader.get_config_path") as mock_cp, \
-         patch("nanobot.config.loader.save_config") as mock_sc, \
-         patch("nanobot.config.loader.load_config") as mock_lc, \
-         patch("nanobot.cli.commands.get_workspace_path") as mock_ws:
-
+    with (
+        patch("nanobot.config.loader.get_config_path") as mock_cp,
+        patch("nanobot.config.loader.save_config") as mock_sc,
+        patch("nanobot.config.loader.load_config") as mock_lc,
+        patch("nanobot.cli.commands.get_workspace_path") as mock_ws,
+    ):
         base_dir = Path("./test_onboard_data")
         if base_dir.exists():
             shutil.rmtree(base_dir)
@@ -206,15 +212,16 @@ def mock_agent_runtime(tmp_path):
     config.agents.defaults.workspace = str(tmp_path / "default-workspace")
     cron_dir = tmp_path / "data" / "cron"
 
-    with patch("nanobot.config.loader.load_config", return_value=config) as mock_load_config, \
-         patch("nanobot.config.paths.get_cron_dir", return_value=cron_dir), \
-         patch("nanobot.cli.commands.sync_workspace_templates") as mock_sync_templates, \
-         patch("nanobot.cli.commands._make_provider", return_value=object()), \
-         patch("nanobot.cli.commands._print_agent_response") as mock_print_response, \
-         patch("nanobot.bus.queue.MessageBus"), \
-         patch("nanobot.cron.service.CronService"), \
-         patch("nanobot.agent.loop.AgentLoop") as mock_agent_loop_cls:
-
+    with (
+        patch("nanobot.config.loader.load_config", return_value=config) as mock_load_config,
+        patch("nanobot.config.paths.get_cron_dir", return_value=cron_dir),
+        patch("nanobot.cli.commands.sync_workspace_templates") as mock_sync_templates,
+        patch("nanobot.cli.commands._make_provider", return_value=object()),
+        patch("nanobot.cli.commands._print_agent_response") as mock_print_response,
+        patch("nanobot.bus.queue.MessageBus"),
+        patch("nanobot.cron.service.CronService"),
+        patch("nanobot.agent.loop.AgentLoop") as mock_agent_loop_cls,
+    ):
         agent_loop = MagicMock()
         agent_loop.channels_config = None
         agent_loop.process_direct = AsyncMock(return_value="mock-response")
@@ -254,7 +261,9 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
         mock_agent_runtime["config"].workspace_path
     )
     mock_agent_runtime["agent_loop"].process_direct.assert_awaited_once()
-    mock_agent_runtime["print_response"].assert_called_once_with("mock-response", render_markdown=True)
+    mock_agent_runtime["print_response"].assert_called_once_with(
+        "mock-response", render_markdown=True
+    )
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
@@ -297,7 +306,9 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
             return None
 
     monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
-    monkeypatch.setattr("nanobot.cli.commands._print_agent_response", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "nanobot.cli.commands._print_agent_response", lambda *_args, **_kwargs: None
+    )
 
     result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
 
@@ -426,6 +437,7 @@ def test_gateway_warns_about_deprecated_memory_window(monkeypatch, tmp_path: Pat
     assert "memoryWindow" in result.stdout
     assert "contextWindowTokens" in result.stdout
 
+
 def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -498,3 +510,55 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
 
     assert isinstance(result.exception, _StopGateway)
     assert "port 18792" in result.stdout
+
+
+def test_openai_codex_resolve_url_uses_default_when_api_base_missing():
+    assert _resolve_codex_url(None) == "https://chatgpt.com/backend-api/codex/responses"
+
+
+def test_openai_codex_resolve_url_appends_codex_responses_suffix():
+    assert (
+        _resolve_codex_url("https://example.com/backend-api")
+        == "https://example.com/backend-api/codex/responses"
+    )
+    assert (
+        _resolve_codex_url("https://example.com/backend-api/codex")
+        == "https://example.com/backend-api/codex/responses"
+    )
+    assert (
+        _resolve_codex_url("https://example.com/backend-api/codex/responses")
+        == "https://example.com/backend-api/codex/responses"
+    )
+
+
+def test_make_provider_passes_openai_codex_api_base_override():
+    config = Config()
+    config.providers.openai_codex.api_key = "placeholder"
+    config.providers.openai_codex.api_base = "https://example.com/backend-api"
+    config.agents.defaults.provider = "openai_codex"
+    config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
+
+    provider = _make_provider(config)
+
+    assert isinstance(provider, OpenAICodexProvider)
+    assert provider.api_base == "https://example.com/backend-api"
+
+
+def test_make_provider_passes_openai_codex_api_key_override():
+    config = Config()
+    config.providers.openai_codex.api_key = "sk-test-key"
+    config.agents.defaults.provider = "openai_codex"
+    config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
+
+    provider = _make_provider(config)
+
+    assert isinstance(provider, OpenAICodexProvider)
+    assert provider.api_key == "sk-test-key"
+
+
+def test_openai_codex_api_key_headers_use_bearer_auth():
+    headers = _build_api_key_headers("sk-test-key")
+
+    assert headers["Authorization"] == "Bearer sk-test-key"
+    assert headers["accept"] == "text/event-stream"
+    assert headers["content-type"] == "application/json"
